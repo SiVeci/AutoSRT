@@ -23,6 +23,21 @@ def sanitize_task_id(task_id: str) -> str:
     return os.path.basename(str(task_id).replace("\\", "/"))
 
 async def save_asset(file: UploadFile, asset_type: str, task_id: str):
+    config_data = await get_config()
+    max_mb = config_data.get("system_settings", {}).get("max_upload_size_mb", 4096)
+    max_bytes = max_mb * 1024 * 1024
+    
+    # 1. 预检文件大小 (如果前端/协议提供了 size)
+    if file.size is not None and file.size > max_bytes:
+        raise HTTPException(status_code=413, detail=f"文件过大 (当前限制: {max_mb}MB)")
+        
+    # 2. 检查磁盘剩余空间 (保留 500MB 安全冗余)
+    _, _, free_bytes = shutil.disk_usage(WORKSPACE_DIR)
+    if free_bytes < 500 * 1024 * 1024:
+        raise HTTPException(status_code=507, detail="服务器磁盘空间极低，已禁止上传")
+    if file.size is not None and free_bytes < (file.size + 200 * 1024 * 1024):
+        raise HTTPException(status_code=507, detail="磁盘空间不足以完整存放该文件")
+
     task_id = sanitize_task_id(task_id)
     task_dir = os.path.join(WORKSPACE_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
@@ -55,21 +70,34 @@ async def save_asset(file: UploadFile, asset_type: str, task_id: str):
     else: 
         raise HTTPException(status_code=400, detail="不支持的资产类型")
     
-    def _save_file(src, dest):
-        with open(dest, "wb") as buffer: shutil.copyfileobj(src, buffer, length=1024*1024*10)
+    def _save_file(src, dest, limit):
+        written = 0
+        with open(dest, "wb") as buffer:
+            while True:
+                chunk = src.read(1024*1024*10)
+                if not chunk: break
+                written += len(chunk)
+                if written > limit:
+                    buffer.close()
+                    if os.path.exists(dest): os.remove(dest)
+                    raise ValueError(f"文件大小超出限制 ({max_mb}MB)")
+                buffer.write(chunk)
             
-    # Bug 4 修复：针对独立上传的音频，先保存为临时文件，再调用 FFmpeg 进行标准化重采样
-    if asset_type == "audio":
-        temp_audio_path = os.path.join(task_dir, f"temp_upload_{uuid.uuid4().hex[:8]}{os.path.splitext(safe_filename)[1]}")
-        await asyncio.to_thread(_save_file, file.file, temp_audio_path)
-        try: await asyncio.to_thread(extract_audio, temp_audio_path, save_path)
-        except Exception as e: raise HTTPException(status_code=500, detail=f"音频标准化重采样失败: {str(e)}")
-        finally:
-            if os.path.exists(temp_audio_path):
-                try: os.remove(temp_audio_path)
-                except Exception: pass
-    else:
-        await asyncio.to_thread(_save_file, file.file, save_path)
+    try:
+        # Bug 4 修复：针对独立上传的音频，先保存为临时文件，再调用 FFmpeg 进行标准化重采样
+        if asset_type == "audio":
+            temp_audio_path = os.path.join(task_dir, f"temp_upload_{uuid.uuid4().hex[:8]}{os.path.splitext(safe_filename)[1]}")
+            await asyncio.to_thread(_save_file, file.file, temp_audio_path, max_bytes)
+            try: await asyncio.to_thread(extract_audio, temp_audio_path, save_path)
+            except Exception as e: raise HTTPException(status_code=500, detail=f"音频标准化重采样失败: {str(e)}")
+            finally:
+                if os.path.exists(temp_audio_path):
+                    try: os.remove(temp_audio_path)
+                    except Exception: pass
+        else:
+            await asyncio.to_thread(_save_file, file.file, save_path, max_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=413, detail=str(e))
         
     with open(meta_path, "w", encoding="utf-8") as f: json.dump(meta_data, f, ensure_ascii=False)
         

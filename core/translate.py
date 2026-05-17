@@ -59,7 +59,7 @@ class LocalClient:
                 )
                 return SimpleNamespace(choices=[choice])
 
-async def translate_batch(client, model_name, system_prompt, batch_content, batch_index, total_batches, semaphore, progress_state, previous_context="", progress_callback=None, temperature=1.0, max_tokens=8192, cancel_event=None):
+async def translate_batch(client, model_name, system_prompt, batch_content, batch_index, total_batches, semaphore, progress_state, previous_context="", progress_callback=None, temperature=1.0, max_tokens=2048, cancel_event=None):
     """
     发送单个分块进行翻译 (异步并发)
     """
@@ -112,7 +112,7 @@ async def translate_batch(client, model_name, system_prompt, batch_content, batc
                 
             choice = completion.choices[0]
             if choice.finish_reason == 'length':
-                raise Exception(f"大模型生成的上下文长度超出限制 (max_tokens 耗尽)。【原因】：可能是翻译文本过长，或者你使用的是带深度思考 (Reasoning) 的模型，思考过程耗尽了配额。请尝试在设置中调低「翻译批次大小 (Batch Size)」，或适当调大 max_tokens 的值。")
+                raise Exception(f"大模型生成的上下文长度超出限制。可能原因：\n1. 翻译文本过长；\n2. 推理过程中产生的“思考过程”耗尽了配额。\n【建议】：调低「批次大小 (Batch Size)」或调大「Context (n_ctx)」并在设置中同步调大「max_tokens」。")
                 
             if not choice.message.content:
                 raise Exception(f"大模型返回了空内容或遇到了安全拦截。响应: {completion}")
@@ -121,6 +121,29 @@ async def translate_batch(client, model_name, system_prompt, batch_content, batc
             translated_text = re.sub(r'<think>.*?</think>', '', translated_text, flags=re.DOTALL)
             translated_text = translated_text.replace("```srt", "").replace("```", "").strip()
             
+            # 统一换行符
+            translated_text = translated_text.replace('\r\n', '\n').replace('\r', '\n')
+            
+            # --- 🛠️ 手术级前言剥离 (Content Anchor Identification) ---
+            # 寻找真正的 SRT 内容起点：定位第一个时间轴
+            # 特征：00:00:00,000 或 0:00:00.000
+            clean_anchor_match = re.search(r"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})", translated_text)
+            if clean_anchor_match:
+                start_pos = clean_anchor_match.start()
+                # 尝试向上回溯，看前面是否跟着一行孤立的序号数字
+                pre_text = translated_text[:start_pos].rstrip()
+                last_newline = pre_text.rfind('\n')
+                potential_idx_line = pre_text[last_newline+1:].strip() if last_newline != -1 else pre_text.strip()
+                
+                if potential_idx_line.isdigit():
+                    # 找到了序号行，从序号行开始截取
+                    actual_start = translated_text.rfind(potential_idx_line, 0, start_pos)
+                    translated_text = translated_text[actual_start:]
+                else:
+                    # 没找到序号行，直接从时间轴开始截取
+                    translated_text = translated_text[start_pos:]
+            # ------------------------------------------------------
+
             progress_state["completed"] += 1
             msg = f"⚡ 正在全速并发翻译中... (已完成 {progress_state['completed']}/{total_batches} 批)"
             
@@ -130,33 +153,43 @@ async def translate_batch(client, model_name, system_prompt, batch_content, batc
                 print(f"   {msg}")
                 
             parsed_blocks = []
-            # 回退：宽容的正则解析方案
-            blocks = translated_text.replace('\r\n', '\n').replace('\r', '\n').split('\n\n')
+            
+            # 辅助函数：标准化时间戳 (复用回退方案中的逻辑)
+            def normalize_time(t_str):
+                t_str = t_str.replace('.', ',')
+                parts = t_str.split(',')
+                main_time = parts[0]
+                ms = parts[1] if len(parts) > 1 else "000"
+                ms = ms.ljust(3, '0')[:3]
+                time_parts = main_time.split(':')
+                time_parts = [p.zfill(2) for p in time_parts]
+                return f"{':'.join(time_parts)},{ms}"
+
+            # 弹性解析方案：不再依赖固定行号
+            blocks = translated_text.split('\n\n')
             for block in blocks:
-                lines = block.strip().split('\n')
-                if len(lines) >= 3:
-                    # 宽容的正则：允许缺位、允许 . 和 , 混用
-                    time_match = re.search(r"(\d{1,2}:\d{1,2}:\d{1,2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{1,2}:\d{1,2}[,.]\d{1,3})", lines[1])
-                    if time_match:
-                        start = time_match.group(1).replace('.', ',')
-                        end = time_match.group(2).replace('.', ',')
-                        
-                        # 补齐不足的位数 (简单的规整逻辑)
-                        def normalize_time(t_str):
-                            parts = t_str.split(',')
-                            main_time = parts[0]
-                            ms = parts[1] if len(parts) > 1 else "000"
-                            ms = ms.ljust(3, '0')
-                            time_parts = main_time.split(':')
-                            time_parts = [p.zfill(2) for p in time_parts]
-                            return f"{':'.join(time_parts)},{ms}"
-                            
-                        start = normalize_time(start)
-                        end = normalize_time(end)
-                        
-                        text = "\n".join(lines[2:])
+                lines = [l.strip() for l in block.split('\n') if l.strip()]
+                if not lines: continue
+                
+                # 在块内每一行搜索时间轴特征
+                time_line_idx = -1
+                time_match = None
+                for idx, line in enumerate(lines):
+                    m = re.search(r"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})", line)
+                    if m:
+                        time_line_idx = idx
+                        time_match = m
+                        break
+                
+                if time_match:
+                    start = normalize_time(time_match.group(1))
+                    end = normalize_time(time_match.group(2))
+                    # 时间轴下方的所有内容视为翻译正文
+                    text = "\n".join(lines[time_line_idx + 1:])
+                    if text:
                         parsed_blocks.append((start, end, text))
-                        
+            
+            # 如果解析依然失败，parsed_blocks 至少是清理过提示词的干净文本
             if not parsed_blocks:
                 parsed_blocks = translated_text
                 
@@ -224,6 +257,7 @@ async def run_llm_translation(
     full_system_prompt = fixed_role_and_lang + fixed_format_instructions + custom_style_prompt
 
     engine = llm_config.get("engine", "api")
+    user_max_tokens = int(llm_config.get("max_tokens", 8192))
     
     if engine == "local":
         local_cfg = llm_config.get("local_settings", {})
@@ -233,12 +267,25 @@ async def run_llm_translation(
         
         # 本地引擎强制并发为 1 以防显存溢出
         concurrent_workers = 1
+        
+        # [上下文保护] 如果 max_tokens 大于 n_ctx，强制下调以防立即崩溃
+        local_n_ctx = int(local_cfg.get("n_ctx", 4096))
+        if user_max_tokens >= local_n_ctx:
+            safe_max_tokens = max(local_n_ctx - 512, 512)
+            msg = f"⚠️ 本地模型窗口 (n_ctx={local_n_ctx}) 小于生成上限 (max_tokens={user_max_tokens})。\n   已自动下调生成上限为 {safe_max_tokens} 以防报错。"
+            print(msg)
+            if progress_callback: progress_callback(msg)
+            user_max_tokens = safe_max_tokens
+
         client = LocalClient(
             model_path=model_path,
             n_gpu_layers=local_cfg.get("n_gpu_layers", -1),
-            n_ctx=local_cfg.get("n_ctx", 4096),
+            n_ctx=local_n_ctx,
             idle_timeout=local_cfg.get("idle_timeout", 300)
         )
+        
+        # [硬重置] 确保每个翻译任务开始时 KV 缓存是空的
+        llm_manager.reset_context()
     else:
         if not api_key:
             raise ValueError("缺少大模型 API Key，请先在设置中配置。")
@@ -325,7 +372,7 @@ async def run_llm_translation(
                     previous_context=prev_context,
                     progress_callback=progress_callback,
                     temperature=float(llm_config.get("temperature", 1.0)),
-                    max_tokens=int(llm_config.get("max_tokens", 8192)),
+                    max_tokens=user_max_tokens,
                     cancel_event=cancel_event
                 )
             )

@@ -70,8 +70,12 @@ export const downloadModel = async (modelId, config) => {
 
 export const getDownloadStatus = () => fetchGet('/api/models/download_status');
 
-export const getLlmModels = async (apiKey, baseUrl) => {
-    const res = await fetch(`${API_BASE}/api/llm/models?api_key=${encodeURIComponent(apiKey)}&base_url=${encodeURIComponent(baseUrl)}`);
+export const getLlmModels = async (api_key, base_url) => {
+    const res = await fetch(`${API_BASE}/api/llm/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key, base_url })
+    });
     if (!res.ok) {
         let errMsg = "获取模型列表失败";
         try { errMsg = (await res.json()).detail || errMsg; } catch(e) {}
@@ -82,8 +86,12 @@ export const getLlmModels = async (apiKey, baseUrl) => {
 
 export const getLocalLlmModels = () => fetchGet('/api/llm/local_models');
 
-export const getAsrModels = async (apiKey, baseUrl) => {
-    const res = await fetch(`${API_BASE}/api/asr/models?api_key=${encodeURIComponent(apiKey)}&base_url=${encodeURIComponent(baseUrl)}`);
+export const getAsrModels = async (api_key, base_url) => {
+    const res = await fetch(`${API_BASE}/api/asr/models`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key, base_url })
+    });
     if (!res.ok) {
         let errMsg = "获取模型列表失败";
         try { errMsg = (await res.json()).detail || errMsg; } catch(e) {}

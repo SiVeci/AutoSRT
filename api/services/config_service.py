@@ -112,9 +112,13 @@ def _migrate_config_internal(config: dict) -> bool:
             }
             changed = True
 
-    if "system_settings" in config and "vram_mutual_exclusion" not in config["system_settings"]:
-        config["system_settings"]["vram_mutual_exclusion"] = True
-        changed = True
+    if "system_settings" in config:
+        if "vram_mutual_exclusion" not in config["system_settings"]:
+            config["system_settings"]["vram_mutual_exclusion"] = True
+            changed = True
+        if "max_upload_size_mb" not in config["system_settings"]:
+            config["system_settings"]["max_upload_size_mb"] = 4096
+            changed = True
 
     # 2. 迁移 online_asr_settings
     if "online_asr_settings" in config and "profiles" not in config["online_asr_settings"]:

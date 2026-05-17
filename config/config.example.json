@@ -3,7 +3,8 @@
     "network_proxy": "",
     "enable_global_proxy": false,
     "use_proxy_for_model_download": false,
-    "vram_mutual_exclusion": true
+    "vram_mutual_exclusion": true,
+    "max_upload_size_mb": 4096
   },
   "secrets": {
     "hf_token": ""

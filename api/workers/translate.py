@@ -1,7 +1,7 @@
 import os
 import asyncio
 
-from ..state import q_translate, global_tasks_status, global_cancel_events, update_task_status, get_task_status, gpu_lock
+from ..state import q_translate, global_tasks_status, global_cancel_events, update_task_status, get_task_status, gpu_lock, is_local_asr, is_local_llm
 from ..ws_manager import manager
 import json
 
@@ -32,30 +32,34 @@ async def process_translate_task(task_id, config_payload, loop):
         system_config = config_payload.get("system_settings", {})
         
         # --- 显存互斥调度机制 ---
-        engine = llm_config.get("engine", "api")
+        is_local = is_local_llm({"config": config_payload, "steps": config_payload.get("steps", [])})
         use_lock = system_config.get("vram_mutual_exclusion", True)
         
-        lock_ctx = gpu_lock if (engine == "local" and use_lock) else asyncio.Lock() # Dummy lock if not needed
-        if engine == "local" and not use_lock:
-            lock_ctx = asyncio.Lock() # Just a local dummy lock
-
         # 引擎感知优先调度 (Engine-Aware Priority Scheduler)
-        # 如果是本地 LLM 引擎且启用了显存互斥，翻译任务必须给“提取”和“识别”任务让路，避免模型互相踢出显存
-        if engine == "local" and use_lock:
+        # 如果是本地 LLM 引擎且启用了显存互斥，翻译任务必须给“本地”识别任务让路
+        if is_local and use_lock:
             while True:
-                has_prior_task = False
-                for t_state in global_tasks_status.values():
-                    if t_state.get("current_step") in ["pending_extract", "extracting", "pending_transcribe", "transcribing"]:
-                        has_prior_task = True
-                        break
-                if not has_prior_task:
+                has_prior_local_asr = False
+                # 使用 list() 拍摄快照，防止遍历时字典大小变化导致 RuntimeError
+                for t_id, t_state in list(global_tasks_status.items()):
+                    if t_id == task_id:
+                        continue
+                        
+                    # 仅针对【当前活跃(in global_cancel_events)】且【处于前置阶段】且【配置为本地】的任务进行避让
+                    if t_id in global_cancel_events and t_state.get("current_step") in ["pending_extract", "extracting", "pending_transcribe", "transcribing"]:
+                        if is_local_asr(t_state):
+                            has_prior_local_asr = True
+                            break
+                if not has_prior_local_asr:
                     break
                 # 静默退让，等待识别任务跑完
                 await asyncio.sleep(1.0)
 
+        lock_ctx = gpu_lock if (is_local and use_lock) else asyncio.Lock() # Dummy lock if not needed
+
         async with lock_ctx:
             await update_task_status(task_id, {"current_step": "translating"})
-            if engine == "local" and use_lock:
+            if is_local and use_lock:
                 print(f"[翻译车间] 任务 {task_id} 已获得 GPU 锁，正在向 Whisper 发送卸载指令...")
                 if transcribe.whisper_process and transcribe.whisper_process.is_alive() and transcribe.whisper_task_queue and transcribe.whisper_result_queue:
                     transcribe.whisper_task_queue.put(("UNLOAD",))
@@ -143,9 +147,13 @@ async def process_translate_task(task_id, config_payload, loop):
 
 async def worker_translate_loop():
     loop = asyncio.get_running_loop()
-    while True:
-        task_id, config_payload = await q_translate.get()
+
+    async def _run_task(t_id, payload):
         try:
-            await process_translate_task(task_id, config_payload, loop)
+            await process_translate_task(t_id, payload, loop)
         finally:
             q_translate.task_done()
+
+    while True:
+        task_id, config_payload = await q_translate.get()
+        asyncio.create_task(_run_task(task_id, config_payload))

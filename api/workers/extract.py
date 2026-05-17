@@ -99,9 +99,13 @@ async def process_extract_task(task_id, config_payload, loop):
 
 async def worker_extract_loop():
     loop = asyncio.get_running_loop()
-    while True:
-        task_id, config_payload = await q_extract.get()
+
+    async def _run_task(t_id, payload):
         try:
-            await process_extract_task(task_id, config_payload, loop)
+            await process_extract_task(t_id, payload, loop)
         finally:
             q_extract.task_done()
+
+    while True:
+        task_id, config_payload = await q_extract.get()
+        asyncio.create_task(_run_task(task_id, config_payload))

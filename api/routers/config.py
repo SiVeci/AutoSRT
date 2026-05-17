@@ -1,7 +1,13 @@
 from fastapi import APIRouter, HTTPException, Body
+from pydantic import BaseModel
+from typing import Optional
 from ..services import config_service
 
 router = APIRouter()
+
+class ModelFetchRequest(BaseModel):
+    api_key: str
+    base_url: Optional[str] = "https://api.openai.com/v1"
 
 @router.get("/system/info")
 def get_system_info():
@@ -43,14 +49,14 @@ async def download_model(model_id: str, payload: dict = Body(...)):
 def get_download_status():
     return config_service.get_download_status()
 
-@router.get("/llm/models")
-def get_llm_models(api_key: str, base_url: str = "https://api.openai.com/v1"):
-    return config_service.get_llm_models(api_key, base_url)
+@router.post("/llm/models")
+def get_llm_models(req: ModelFetchRequest):
+    return config_service.get_llm_models(req.api_key, req.base_url)
 
 @router.get("/llm/local_models")
 def get_local_llm_models():
     return config_service.get_local_llm_models()
 
-@router.get("/asr/models")
-def get_asr_models(api_key: str, base_url: str = "https://api.openai.com/v1"):
-    return config_service.get_asr_models(api_key, base_url)
+@router.post("/asr/models")
+def get_asr_models(req: ModelFetchRequest):
+    return config_service.get_asr_models(req.api_key, req.base_url)

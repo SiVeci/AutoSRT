@@ -78,3 +78,32 @@ async def update_task_status(task_id: str, status_data: dict):
 def delete_task_status(task_id: str):
     """清理内存中的任务状态缓存"""
     global_tasks_status.pop(task_id, None)
+
+def is_local_asr(t_state: dict) -> bool:
+    """判定任务是否使用本地识别引擎"""
+    config = t_state.get("config") or {}
+    trans_settings = config.get("transcribe_settings")
+
+    # 如果识别引擎明确是 api，那它绝对不是本地识别
+    if isinstance(trans_settings, dict) and trans_settings.get("engine") == "api":
+        return False
+
+    # 只有当包含 transcribe 步骤，且引擎不是 api 时，才视为本地识别
+    steps = t_state.get("steps") or config.get("steps") or []
+    if "transcribe" in steps:
+        # 兜底：如果 trans_settings 缺失或没有 engine，默认视为本地
+        engine = (trans_settings or {}).get("engine", "local")
+        return engine != "api"
+    return False
+
+def is_local_llm(t_state: dict) -> bool:
+    """判定任务是否使用本地翻译引擎"""
+    config = t_state.get("config") or {}
+    llm_settings = config.get("llm_settings")
+
+    # 如果翻译引擎明确是 local，判定为本地
+    if isinstance(llm_settings, dict) and llm_settings.get("engine") == "local":
+        # 还需要确认包含 translate 步骤
+        steps = t_state.get("steps") or config.get("steps") or []
+        return "translate" in steps
+    return False

@@ -26,9 +26,12 @@ class LocalLLMManager:
             return
         self.model: Optional[Llama] = None
         self.current_model_path: str = ""
+        self.current_n_ctx: int = 0
+        self.current_n_gpu_layers: int = 0
         self.idle_timer: Optional[asyncio.TimerHandle] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self._inference_lock = threading.Lock()
+        self._load_lock = asyncio.Lock()
         self._initialized = True
 
     def _reset_idle_timer(self, timeout: int):
@@ -45,6 +48,8 @@ class LocalLLMManager:
             del self.model
             self.model = None
             self.current_model_path = ""
+            self.current_n_ctx = 0
+            self.current_n_gpu_layers = 0
             gc.collect()
             # If using CUDA, we might need to clear cache if possible, 
             # but usually gc.collect() + deleting the object is enough for llama-cpp.
@@ -52,6 +57,15 @@ class LocalLLMManager:
         if self.idle_timer:
             self.idle_timer.cancel()
             self.idle_timer = None
+
+    def reset_context(self):
+        """显式重置本地 LLM 的上下文缓存 (KV Cache)，确保新任务开始时无残留"""
+        if self.model:
+            print(f"[*] 正在手动重置本地 LLM 上下文缓存 (KV Cache)...")
+            try:
+                self.model.reset()
+            except Exception as e:
+                print(f"[!] 重置上下文缓存失败 (可能由于模型未就绪): {e}")
 
     async def async_release_model(self):
         """异步安全释放模型：确保当前没有正在执行的推理孤儿线程后再释放，防止段错误或 OOM"""
@@ -67,27 +81,33 @@ class LocalLLMManager:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"找不到本地模型文件: {model_path}")
 
-        if self.model and self.current_model_path == model_path:
+        async with self._load_lock:
+            if self.model and \
+               self.current_model_path == model_path and \
+               self.current_n_ctx == n_ctx and \
+               self.current_n_gpu_layers == n_gpu_layers:
+                return self.model
+
+            # If parameters change or a different model is requested, release first
+            if self.model:
+                self.release_model()
+
+            print(f"[*] 正在加载本地 LLM 模型: {model_path} (GPU Layers: {n_gpu_layers}, Context: {n_ctx})...")
+            
+            # In a separate thread to not block event loop
+            def load():
+                return Llama(
+                    model_path=model_path,
+                    n_gpu_layers=n_gpu_layers,
+                    n_ctx=n_ctx,
+                    verbose=False
+                )
+            
+            self.model = await asyncio.to_thread(load)
+            self.current_model_path = model_path
+            self.current_n_ctx = n_ctx
+            self.current_n_gpu_layers = n_gpu_layers
             return self.model
-
-        # If a different model is loaded, release it first
-        if self.model:
-            self.release_model()
-
-        print(f"[*] 正在加载本地 LLM 模型: {model_path} (GPU Layers: {n_gpu_layers}, Context: {n_ctx})...")
-        
-        # In a separate thread to not block event loop
-        def load():
-            return Llama(
-                model_path=model_path,
-                n_gpu_layers=n_gpu_layers,
-                n_ctx=n_ctx,
-                verbose=False
-            )
-        
-        self.model = await asyncio.to_thread(load)
-        self.current_model_path = model_path
-        return self.model
 
     async def chat_completion(self, 
                                model_path: str, 

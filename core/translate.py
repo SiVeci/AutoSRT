@@ -129,36 +129,36 @@ async def translate_batch(client, model_name, system_prompt, batch_content, batc
             else:
                 print(f"   {msg}")
                 
-            import json
             parsed_blocks = []
-            
-            # 清理潜在的 Markdown 标记
-            cleaned_text = translated_text.replace("```json", "").replace("```", "").strip()
-            # 有时模型仍然会在 JSON 外包裹文字，尝试定位 JSON 数组边界
-            json_start = cleaned_text.find('[')
-            json_end = cleaned_text.rfind(']')
-            if json_start != -1 and json_end != -1 and json_end > json_start:
-                cleaned_text = cleaned_text[json_start:json_end+1]
-
-            try:
-                json_data = json.loads(cleaned_text)
-                if isinstance(json_data, list):
-                    for item in json_data:
-                        start = item.get('start', '').strip()
-                        end = item.get('end', '').strip()
-                        text = item.get('text', '').strip()
-                        if start and end and text:
-                            parsed_blocks.append((start, end, text))
-                else:
-                    raise Exception("大模型返回了 JSON 但不是预期的数组格式。")
-            except json.JSONDecodeError as e:
-                print(f"JSON 解析失败: {e}")
-                print(f"原始响应文本: {cleaned_text}")
-                # 解析失败引发异常，交由外层重试机制处理
-                raise Exception(f"大模型未返回合法的 JSON 格式数据。")
-                
+            # 回退：宽容的正则解析方案
+            blocks = translated_text.replace('\r\n', '\n').replace('\r', '\n').split('\n\n')
+            for block in blocks:
+                lines = block.strip().split('\n')
+                if len(lines) >= 3:
+                    # 宽容的正则：允许缺位、允许 . 和 , 混用
+                    time_match = re.search(r"(\d{1,2}:\d{1,2}:\d{1,2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{1,2}:\d{1,2}[,.]\d{1,3})", lines[1])
+                    if time_match:
+                        start = time_match.group(1).replace('.', ',')
+                        end = time_match.group(2).replace('.', ',')
+                        
+                        # 补齐不足的位数 (简单的规整逻辑)
+                        def normalize_time(t_str):
+                            parts = t_str.split(',')
+                            main_time = parts[0]
+                            ms = parts[1] if len(parts) > 1 else "000"
+                            ms = ms.ljust(3, '0')
+                            time_parts = main_time.split(':')
+                            time_parts = [p.zfill(2) for p in time_parts]
+                            return f"{':'.join(time_parts)},{ms}"
+                            
+                        start = normalize_time(start)
+                        end = normalize_time(end)
+                        
+                        text = "\n".join(lines[2:])
+                        parsed_blocks.append((start, end, text))
+                        
             if not parsed_blocks:
-                raise Exception(f"成功解析了 JSON，但未能提取到任何有效的字幕块。")
+                parsed_blocks = translated_text
                 
             return (batch_index, parsed_blocks, batch_content)
 
@@ -211,14 +211,9 @@ async def run_llm_translation(
 
     fixed_role_and_lang = f"你是一位精通各国文化的专业影视字幕翻译。\n任务：将用户提供的 SRT 字幕片段翻译成【{lang_name}】。\n\n"
     fixed_format_instructions = """### 🚫 格式死命令：
-1. **必须输出纯 JSON**：你必须严格返回一个合法的 JSON 数组，包含所有翻译后的字幕块。不要输出任何 Markdown 标记（如 ```json），不要包含任何其他解释性文本。
-2. **JSON 结构要求**：每个对象必须包含 "start"、"end" 和 "text" 三个字符串字段。
-3. **保留时间轴**：将原始的起止时间分别填入 "start" 和 "end"。"text" 字段填入翻译后的文本。不要合并或遗漏任何片段。
-示例输出：
-[
-  {"start": "00:00:01,000", "end": "00:00:03,000", "text": "这是第一句翻译"},
-  {"start": "00:00:03,000", "end": "00:00:05,000", "text": "这是第二句翻译"}
-]
+1. **保留原文结构**：这是字幕片段，不要合并，不要遗漏。
+2. **保留时间轴**：所有时间戳（如 00:00:01,000 --> ...）必须原样保留，不得修改。
+3. **只输出结果**：不要加“好的”、“片段翻译如下”等废话，直接输出 SRT 格式文本。
 
 """
 

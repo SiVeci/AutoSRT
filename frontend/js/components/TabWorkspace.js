@@ -121,7 +121,7 @@ export default {
                                 </el-dropdown>
                                 <!-- 本地视频 (拖拽上传) -->
                                 <el-dropdown v-else-if="scope.row.has_video" trigger="click" @command="(cmd) => handleAssetCommand(cmd, scope.row, 'video')">
-                                    <el-tag size="small" type="success" effect="plain" style="cursor: pointer;">本地视频</el-tag>
+                                    <el-tag size="small" type="success" effect="plain" style="cursor: pointer;">视频</el-tag>
                                     <template #dropdown>
                                         <el-dropdown-menu>
                                             <el-dropdown-item command="download" icon="Download">下载</el-dropdown-item>

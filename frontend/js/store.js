@@ -49,6 +49,7 @@ export const store = reactive({
         model_settings: { model_size: "medium", download_root: "models" },
         transcribe_settings: { 
             engine: "local",
+            idle_timeout: 300,
             language: null, 
             task: "transcribe",
             temperature: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],

@@ -120,6 +120,11 @@ def _migrate_config_internal(config: dict) -> bool:
             config["system_settings"]["max_upload_size_mb"] = 4096
             changed = True
 
+    if "transcribe_settings" in config:
+        if "idle_timeout" not in config["transcribe_settings"]:
+            config["transcribe_settings"]["idle_timeout"] = 300
+            changed = True
+
     # 2. 迁移 online_asr_settings
     if "online_asr_settings" in config and "profiles" not in config["online_asr_settings"]:
         old_asr = config["online_asr_settings"]

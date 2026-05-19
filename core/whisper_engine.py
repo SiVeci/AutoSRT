@@ -41,14 +41,15 @@ def unload_model():
 def worker_process_loop(task_queue: Queue, result_queue: Queue):
     """
     独立运行的子进程循环。
-    不断从 task_queue 获取任务，如果 5 分钟内没有新任务，则自动退出以彻底释放显存。
+    不断从 task_queue 获取任务，支持根据用户配置动态设置空闲超时自动退出以彻底释放显存。
     """
     global _cached_model, _cached_model_params
+    current_idle_timeout = 300
 
     while True:
         try:
-            # 5 分钟超时，如果在 300 秒内没有拿到新任务，抛出 Empty 异常
-            task = task_queue.get(timeout=300)
+            wait_time = current_idle_timeout if current_idle_timeout > 0 else 99999999
+            task = task_queue.get(timeout=wait_time)
             if task is None: 
                 break
             
@@ -59,10 +60,11 @@ def worker_process_loop(task_queue: Queue, result_queue: Queue):
                 continue
 
         except Empty:
-            print("[Whisper Worker] 5分钟无任务，主动退出释放显存。")
+            print(f"[Whisper Worker] {wait_time}秒无任务，主动退出释放显存。")
             sys.exit(0)
             
         task_id, audio_path, output_srt, model_settings, transcribe_settings, vad_settings, system_config, secrets_settings = task
+        current_idle_timeout = transcribe_settings.get("idle_timeout", 300)
         
         try:
             model_size = model_settings.get("model_size", "large-v2")
@@ -130,6 +132,7 @@ def worker_process_loop(task_queue: Queue, result_queue: Queue):
             
             transcribe_kwargs = transcribe_settings.copy()
             transcribe_kwargs.pop("engine", None)
+            transcribe_kwargs.pop("idle_timeout", None)
             
             segments, info = _cached_model.transcribe(
                 audio_path,
@@ -230,6 +233,7 @@ def transcribe_audio(
     
     transcribe_kwargs = transcribe_settings.copy()
     transcribe_kwargs.pop("engine", None)
+    transcribe_kwargs.pop("idle_timeout", None)
     
     segments, info = _cached_model.transcribe(
         audio_path,

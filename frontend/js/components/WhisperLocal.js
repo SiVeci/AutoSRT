@@ -63,6 +63,19 @@ export default {
                             </el-option-group>
                         </el-select>
                     </el-form-item>
+
+                    <el-form-item>
+                        <template #label>
+                            <span style="display: inline-flex; align-items: center;">
+                                闲置释放时间
+                                <el-tooltip content="当识别任务完成后，模型在显存中继续驻留的倒计时。如果在该时间内没有新的识别任务，模型将自动从显存卸载。填 0 代表永不自动释放。" placement="top" trigger="click">
+                                    <el-icon style="margin-left: 4px; cursor: pointer; color: #909399;" @click.stop.prevent><QuestionFilled /></el-icon>
+                                </el-tooltip>
+                            </span>
+                        </template>
+                        <el-input-number v-model="store.config.transcribe_settings.idle_timeout" :min="0" :max="3600" :step="60"></el-input-number>
+                        <span style="margin-left: 8px; color: #909399;">秒 (0 代表不释放)</span>
+                    </el-form-item>
                 </el-form>
             </el-card>
 

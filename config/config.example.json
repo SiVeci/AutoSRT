@@ -15,6 +15,7 @@
   },
   "transcribe_settings": {
     "engine": "local",
+    "idle_timeout": 300,
     "language": null,
     "task": "transcribe",
     "log_progress": false,

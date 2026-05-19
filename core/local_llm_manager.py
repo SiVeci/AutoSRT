@@ -2,13 +2,11 @@ import os
 import time
 import asyncio
 import threading
-import gc
+import uuid
 from typing import Optional, List, Dict, Any
-
-try:
-    from llama_cpp import Llama
-except ImportError:
-    Llama = None
+from multiprocessing import Process, Queue
+from queue import Empty
+from core.llm_engine import llm_worker_process_loop
 
 class LocalLLMManager:
     _instance = None
@@ -24,90 +22,102 @@ class LocalLLMManager:
     def __init__(self):
         if self._initialized:
             return
-        self.model: Optional[Llama] = None
-        self.current_model_path: str = ""
-        self.current_n_ctx: int = 0
-        self.current_n_gpu_layers: int = 0
         self.idle_timer: Optional[asyncio.TimerHandle] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self._inference_lock = threading.Lock()
-        self._load_lock = asyncio.Lock()
+        
+        self.llm_process: Optional[Process] = None
+        self.llm_task_queue: Optional[Queue] = None
+        self.llm_result_queue: Optional[Queue] = None
+        
+        # 结果等待字典，用于将子进程吐出的结果分发回对应的协程
+        self._pending_requests = {}
+        
         self._initialized = True
+
+    def ensure_llm_worker_running(self):
+        if self.llm_process is None or not self.llm_process.is_alive():
+            print("[进程管理] 启动新的 LLM 推理子进程...")
+            self.llm_task_queue = Queue()
+            self.llm_result_queue = Queue()
+            self.llm_process = Process(
+                target=llm_worker_process_loop, 
+                args=(self.llm_task_queue, self.llm_result_queue), 
+                daemon=True
+            )
+            self.llm_process.start()
+            
+            # 如果已有循环，启动队列轮询监听器
+            if self.loop and self.loop.is_running():
+                self.loop.create_task(self._poll_results())
+
+    async def _poll_results(self):
+        """异步持续轮询子进程返回的结果，并分发给等待的协程"""
+        while self.llm_process and self.llm_process.is_alive():
+            try:
+                # 使用 run_in_executor 避免阻塞主循环
+                msg = await self.loop.run_in_executor(None, self.llm_result_queue.get, True, 0.5)
+                if isinstance(msg, dict):
+                    msg_type = msg.get("type")
+                    req_id = msg.get("req_id")
+                    
+                    if req_id and req_id in self._pending_requests:
+                        future = self._pending_requests[req_id]
+                        if not future.done():
+                            if msg_type == "error":
+                                future.set_exception(Exception(msg.get("error")))
+                            else:
+                                future.set_result(msg)
+                    elif msg_type == "unloaded" and "UNLOAD" in self._pending_requests:
+                        future = self._pending_requests["UNLOAD"]
+                        if not future.done():
+                            future.set_result(True)
+                    elif msg_type == "reset_done" and "RESET" in self._pending_requests:
+                        future = self._pending_requests["RESET"]
+                        if not future.done():
+                            future.set_result(True)
+            except Empty:
+                await asyncio.sleep(0) # 让出控制权
+            except Exception as e:
+                print(f"[LLM Agent] 轮询异常: {e}")
+                await asyncio.sleep(1)
 
     def _reset_idle_timer(self, timeout: int):
         if self.idle_timer:
             self.idle_timer.cancel()
         
         if self.loop and timeout > 0:
-            self.idle_timer = self.loop.call_later(timeout, self.release_model)
-
-    def release_model(self):
-        if self.model:
-            print(f"[*] 离线 LLM 模型已超过闲置时间，正在释放显存: {self.current_model_path}")
-            # llama-cpp-python release
-            del self.model
-            self.model = None
-            self.current_model_path = ""
-            self.current_n_ctx = 0
-            self.current_n_gpu_layers = 0
-            gc.collect()
-            # If using CUDA, we might need to clear cache if possible, 
-            # but usually gc.collect() + deleting the object is enough for llama-cpp.
-        
-        if self.idle_timer:
-            self.idle_timer.cancel()
-            self.idle_timer = None
-
-    def reset_context(self):
-        """显式重置本地 LLM 的上下文缓存 (KV Cache)，确保新任务开始时无残留"""
-        if self.model:
-            print(f"[*] 正在手动重置本地 LLM 上下文缓存 (KV Cache)...")
-            try:
-                self.model.reset()
-            except Exception as e:
-                print(f"[!] 重置上下文缓存失败 (可能由于模型未就绪): {e}")
+            self.idle_timer = self.loop.call_later(timeout, lambda: self.loop.create_task(self.async_release_model()))
 
     async def async_release_model(self):
-        """异步安全释放模型：确保当前没有正在执行的推理孤儿线程后再释放，防止段错误或 OOM"""
-        def _safe_release():
-            with self._inference_lock:
-                self.release_model()
-        await asyncio.to_thread(_safe_release)
-
-    async def get_model(self, model_path: str, n_gpu_layers: int = -1, n_ctx: int = 4096) -> Llama:
-        if Llama is None:
-            raise ImportError("未安装 llama-cpp-python，无法使用本地推理功能。")
-
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"找不到本地模型文件: {model_path}")
-
-        async with self._load_lock:
-            if self.model and \
-               self.current_model_path == model_path and \
-               self.current_n_ctx == n_ctx and \
-               self.current_n_gpu_layers == n_gpu_layers:
-                return self.model
-
-            # If parameters change or a different model is requested, release first
-            if self.model:
-                self.release_model()
-
-            print(f"[*] 正在加载本地 LLM 模型: {model_path} (GPU Layers: {n_gpu_layers}, Context: {n_ctx})...")
+        """异步安全释放模型：向子进程发送卸载指令"""
+        if self.llm_process and self.llm_process.is_alive() and self.llm_task_queue:
+            if not self.loop:
+                self.loop = asyncio.get_running_loop()
             
-            # In a separate thread to not block event loop
-            def load():
-                return Llama(
-                    model_path=model_path,
-                    n_gpu_layers=n_gpu_layers,
-                    n_ctx=n_ctx,
-                    verbose=False
-                )
+            future = self.loop.create_future()
+            self._pending_requests["UNLOAD"] = future
+            self.llm_task_queue.put(("UNLOAD",))
             
-            self.model = await asyncio.to_thread(load)
-            self.current_model_path = model_path
-            self.current_n_ctx = n_ctx
-            self.current_n_gpu_layers = n_gpu_layers
-            return self.model
+            try:
+                # 等待卸载完成，最多等 10 秒
+                await asyncio.wait_for(future, timeout=10.0)
+            except asyncio.TimeoutError:
+                print("[!] 等待 LLM 子进程释放模型超时。")
+            finally:
+                self._pending_requests.pop("UNLOAD", None)
+                if self.idle_timer:
+                    self.idle_timer.cancel()
+                    self.idle_timer = None
+
+    def reset_context(self):
+        """向子进程发送重置指令"""
+        if self.llm_process and self.llm_process.is_alive() and self.llm_task_queue:
+            if not self.loop:
+                return # 同步上下文中暂不强制等待重置
+            future = self.loop.create_future()
+            self._pending_requests["RESET"] = future
+            self.llm_task_queue.put(("RESET",))
+            # 采用即发即弃策略，不阻塞等待
 
     async def chat_completion(self, 
                                model_path: str, 
@@ -119,26 +129,34 @@ class LocalLLMManager:
                                idle_timeout: int = 300) -> Dict[str, Any]:
         
         self.loop = asyncio.get_running_loop()
-        model = await self.get_model(model_path, n_gpu_layers, n_ctx)
+        self.ensure_llm_worker_running()
         
-        # Reset idle timer before starting work
         if self.idle_timer:
             self.idle_timer.cancel()
 
+        req_id = str(uuid.uuid4())
+        future = self.loop.create_future()
+        self._pending_requests[req_id] = future
+
         try:
-            # chat completion
-            def run():
-                with self._inference_lock:
-                    return model.create_chat_completion(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens
-                    )
+            self.llm_task_queue.put((
+                "CHAT", 
+                req_id, 
+                model_path, 
+                messages, 
+                temperature, 
+                max_tokens, 
+                n_gpu_layers, 
+                n_ctx,
+                idle_timeout
+            ))
             
-            response = await asyncio.to_thread(run)
-            return response
+            # 等待子进程返回结果
+            result = await future
+            return result.get("response")
+            
         finally:
-            # Start/Reset idle timer after work
+            self._pending_requests.pop(req_id, None)
             self._reset_idle_timer(idle_timeout)
 
 # Global singleton

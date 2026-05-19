@@ -2,7 +2,7 @@ const { ref } = Vue;
 import WhisperLocal from './WhisperLocal.js';
 import WhisperApi from './WhisperApi.js';
 import { store, addLog, connectTaskMonitor } from '../store.js';
-import { executeTask, retryTask, updateConfig } from '../api.js';
+import { executeTask, retryTask, updateConfig, uploadAsset } from '../api.js';
 
 export default {
     name: 'TabWhisper',
@@ -10,8 +10,29 @@ export default {
     template: `
         <div class="whisper-container">
             <el-alert title="提示" type="info" show-icon style="margin-bottom: 20px;" :closable="false">
-                将提取出的音频输入 faster-whisper 引擎进行识别，生成带有精确时间轴的原始语言字幕 (SRT)。如果你已有现成的原生字幕文件，可直接跳到下一页 [LLM 翻译] 进行独立上传。
+                将提取出的音频输入 faster-whisper 引擎进行识别，生成带有精确时间轴的原始语言字幕 (SRT)。如果你已有现成的原生字幕文件，可直接在此处上传，跳过本页的识别步骤。
             </el-alert>
+
+            <el-card shadow="never" style="margin-bottom: 20px; border: 1px solid #ebeef5;">
+                <template #header>
+                    <div class="card-title"><el-icon style="margin-right:4px;"><Upload /></el-icon>独立字幕输入通道</div>
+                </template>
+                <div class="section-desc">
+                    如果您已经拥有外部的生肉字幕文件，可在此直接上传，跳过识别步骤。
+                </div>
+                <el-upload
+                    action="#"
+                    :auto-upload="true"
+                    :http-request="handleSrtUpload"
+                    :show-file-list="false"
+                    accept=".srt,.vtt"
+                    :disabled="store.isProcessing || isUploading"
+                >
+                    <el-button type="success" plain :loading="isUploading">
+                        <el-icon style="margin-right: 5px;"><Upload /></el-icon> 直接上传外部字幕 (绕过识别)
+                    </el-button>
+                </el-upload>
+            </el-card>
 
             <el-tabs v-model="store.config.transcribe_settings.engine" style="margin-bottom: 20px;" stretch>
                 <!-- 引擎 1: 本地 GPU -->
@@ -55,11 +76,11 @@ export default {
                 </span>
                 </el-button>
                 
-                <span v-if="!store.assets.hasAudio" class="status-text-error">
-                    请先在前方提供音频
-                </span>
-                <span v-else-if="store.assets.hasOriginalSrt" class="status-text-success">
+                <span v-if="store.assets.hasOriginalSrt" class="status-text-success">
                     原声字幕已生成，可前往翻译
+                </span>
+                <span v-else-if="!store.assets.hasAudio" class="status-text-error">
+                    请先在前方提供音频
                 </span>
             </div>
             
@@ -73,6 +94,28 @@ export default {
         </div>
     `,
     setup() {
+        const isUploading = ref(false);
+
+        const handleSrtUpload = async (options) => {
+            addLog(`开始上传外部生肉字幕: ${options.file.name}...`, "info");
+            isUploading.value = true;
+            try {
+                const res = await uploadAsset(options.file, 'srt', store.taskId, null);
+                store.taskId = res.task_id;
+                store.currentTaskName = options.file.name;
+                store.assets.hasOriginalSrt = true;
+                store.activeStep = 4;
+                store.refreshTasksTrigger++;
+                addLog(`外部字幕上传成功！任务 ID: \${res.task_id}`, "success");
+                ElementPlus.ElMessage.success("生肉字幕上传成功，可以直接前往【LLM 翻译】！");
+            } catch (e) {
+                addLog(`字幕上传失败: \${e.message}`, "error");
+                ElementPlus.ElMessage.error(`上传失败: \${e.message}`);
+            } finally {
+                isUploading.value = false;
+            }
+        };
+
         // 启动识别
         const runTranscribe = async () => {
             if (!store.taskId || !store.assets.hasAudio) return;
@@ -124,6 +167,6 @@ export default {
             }
         };
 
-        return { store, runTranscribe };
+        return { store, isUploading, handleSrtUpload, runTranscribe };
     }
 };

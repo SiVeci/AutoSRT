@@ -46,13 +46,13 @@ export default {
                     <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
                         <span class="card-title"><el-icon style="margin-right:4px;"><DataBoard /></el-icon>流水线看板与资产库</span>
                         <div style="display: flex; gap: 10px;">
-                            <el-dropdown trigger="click" @command="handleClearCommand" :disabled="taskList.length === 0">
-                                <el-button type="danger" size="small" plain>
-                                    <el-icon><Delete /></el-icon> 资产清理 <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+                            <el-dropdown trigger="click" @command="handleClearCommand" :disabled="selectedTasks.length === 0">
+                                <el-button type="danger" size="small" plain :disabled="selectedTasks.length === 0">
+                                    <el-icon><Delete /></el-icon> 勾选资产清理 <el-icon class="el-icon--right"><ArrowDown /></el-icon>
                                 </el-button>
                                 <template #dropdown>
                                     <el-dropdown-menu>
-                                        <el-dropdown-item command="all" icon="DeleteFilled">清空全部任务</el-dropdown-item>
+                                        <el-dropdown-item command="all" icon="DeleteFilled">清空勾选任务</el-dropdown-item>
                                         <el-dropdown-item divided command="video" icon="VideoCamera">清理本地视频</el-dropdown-item>
                                         <el-dropdown-item command="audio" icon="Headset">清理音频</el-dropdown-item>
                                         <el-dropdown-item command="original" icon="Document">清理原声字幕</el-dropdown-item>
@@ -642,8 +642,8 @@ export default {
             } catch (e) { if(e !== 'cancel') ElementPlus.ElMessage.error(e.message || "删除失败"); }
         };
 
-        const clearAllTasks = async () => {
-            if (taskList.value.length === 0) return;
+        const clearAllTasks = async (tasks) => {
+            if (tasks.length === 0) return;
             try {
                 await ElementPlus.ElMessageBox.confirm('确定要清空所有历史任务及其产生的物理文件吗？此操作将腾出大量磁盘空间且不可逆。', '高危预警', { 
                     confirmButtonText: '全部清空', 
@@ -654,7 +654,7 @@ export default {
                 isLoadingTasks.value = true;
                 let successCount = 0;
                 // 串行发出删除请求，避免前端网络拥塞和后端磁盘 I/O 风暴
-                for (const task of taskList.value) {
+                for (const task of tasks) {
                     try {
                         await deleteTask(task.task_id);
                         successCount++;
@@ -674,7 +674,7 @@ export default {
 
         const handleClearCommand = async (cmd) => {
             if (cmd === 'all') {
-                clearAllTasks();
+                clearAllTasks(selectedTasks.value);
                 return;
             }
 
@@ -693,7 +693,7 @@ export default {
                 const loading = ElementPlus.ElLoading.service({ lock: true, text: `正在批量清理 ${targetName}...` });
 
                 try {
-                    for (const task of taskList.value) {
+                    for (const task of selectedTasks.value) {
                         // 检查该任务是否有目标资产
                         if (cmd === 'video' && !task.has_video) continue;
                         if (cmd === 'audio' && !task.has_audio) continue;
@@ -716,7 +716,28 @@ export default {
                     }
                 } finally {
                     loading.close();
-                    fetchTasks(); // 刷新列表以更新 UI 状态
+                    for (const task of selectedTasks.value) {
+                        try {
+                            const latestData = await getTaskAssets(task.task_id);
+                            const idx = taskList.value.findIndex(t => t.task_id === task.task_id);
+                            if (idx !== -1) {
+                                taskList.value[idx].has_video = latestData.has_video;
+                                taskList.value[idx].has_abs_video = latestData.has_abs_video;
+                                taskList.value[idx].has_audio = latestData.has_audio;
+                                taskList.value[idx].has_original_srt = latestData.has_original_srt;
+                                taskList.value[idx].has_translated_srt = latestData.has_translated_srt;
+                                taskList.value[idx].current_step = latestData.current_step;
+                            }
+                            if (task.task_id === store.taskId) {
+                                store.assets.hasVideo = latestData.has_video;
+                                store.assets.hasAudio = latestData.has_audio;
+                                store.assets.hasOriginalSrt = latestData.has_original_srt;
+                                store.assets.hasTranslatedSrt = latestData.has_translated_srt;
+                            }
+                        } catch (e) {
+                            console.warn(`[清理后刷新] 无法获取任务 ${task.task_id} 的最新资产状态`, e);
+                        }
+                    }
                     
                     if (skippedCount > 0) {
                         ElementPlus.ElMessage.warning(`清理完成：成功删除 ${successCount} 份，跳过 ${skippedCount} 份 (受保护的映射文件或不可删除的最后一份资产)。`);
